@@ -20,7 +20,10 @@ export {
   type TaskNotificationTarget,
 } from "./taskNotifications";
 import { withAgentActivity } from "./agentOrder";
-import { clearTerminalComposerDrafts } from "./terminalComposer";
+import {
+  clearSavedTerminalComposerDrafts,
+  clearTerminalComposerDrafts,
+} from "./terminalComposer";
 import {
   forgetClosedTabPins,
   paneCloseBlockReason,
@@ -659,6 +662,7 @@ function wait(ms: number) {
 }
 
 function redirectToLogin() {
+  clearSavedTerminalComposerDrafts();
   const loginUrl = new URL("/login", window.location.origin);
   window.location.replace(loginUrl.href);
 }
@@ -3033,9 +3037,21 @@ export const store = {
   },
 
   closeWorkspace(workspaceId: string) {
+    const paneIds = state.panes
+      .filter((pane) => pane.workspace_id === workspaceId)
+      .map((pane) => pane.pane_id);
     return action(
-      (lease) =>
-        lease.client.call("workspace.close", { workspace_id: workspaceId }),
+      async (lease) => {
+        const result = await lease.client.call("workspace.close", {
+          workspace_id: workspaceId,
+        });
+        clearTerminalComposerDrafts(
+          lease.connectionId,
+          lease.generation,
+          paneIds,
+        );
+        return result;
+      },
       {
         failureNotice: (error) => ({
           kind: "error",
@@ -4090,6 +4106,7 @@ export const store = {
 
 /** Test-only singleton seam for deterministic deferred production-store tests. */
 export const __storeTesting = {
+  reloadWhenUpdatedServerIsReady,
   notifyRangerTask,
   handleBridgeStatus,
   handleHerdrEvent,

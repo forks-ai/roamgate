@@ -133,7 +133,27 @@ Actions remember their originating checkout and never fall back to a sibling.
 Terminals stay mounted while the Inspector changes.
 
 Browser preferences live in namespaced `localStorage` and sync across tabs on the
-same origin. Navigation, open files, drafts, and focus stay per tab.
+same origin. Navigation, open files, live draft edits, and focus stay per tab.
+
+Message and Agent History composers share drafts by connection destination,
+pane, and terminal identity. Each edit saves text in `sessionStorage` for tab
+reloads and `localStorage` for reopening the app; a new tab starts with the last
+saved text, then edits independently. Connection generations still guard sends
+and async uploads, but do not own the saved text. Recovery never sends a draft.
+Sending, discarding, closing its pane through Roamgate, or logging out clears
+the saved text. Storage events immediately clear live drafts and old session
+copies on logout; a shared marker also invalidates copies in tabs that missed
+the event. Authentication-loss redirects clear drafts too, including a direct
+server redirect to login before the app loads. Successful closes and observed
+pane removals clear the shared backup
+even when another tab wrote it, and retire drafts from all connection
+generations. A fresh topology also clears saved copies of removed panes in a
+reloaded tab. Failed close requests preserve editable drafts.
+Paths retained after a partial upload failure are saved with the original
+destination's draft; reconnect callbacks append paths without replacing newer
+edits or sending input. Unsent input may contain sensitive information and
+remains in this browser until cleared. If browser storage is unavailable, only
+in-memory reconnect recovery is available.
 
 ### Last step capture limits and ownership
 

@@ -1,15 +1,29 @@
-import type { ConnectionClient } from "./api";
+import type { ConnectionClient, ConnectionSummary } from "./api";
+import {
+  roamgateLocalStorage,
+  roamgateSessionStorage,
+  subscribeLocalStorage,
+} from "./browserStorage";
 import { prepareTerminalPasteText } from "./terminalPaste";
+import type { Pane } from "./types";
 
 /**
  * Draft storage for the mobile terminal composer.
  *
- * Drafts live only in memory: terminal input can contain secrets, so they
- * must never reach localStorage. Keys are scoped by connection identity
- * (including the reconnect generation) and pane ID, so a reconnect or a pane
- * switch never mixes drafts or sends text to the wrong pane.
+ * Live operations keep their connection generation guard. Saved text belongs
+ * to the connection destination, pane and terminal instead, so reconnecting
+ * can recover it without reviving requests from the old connection.
+ * Session storage preserves independent tab edits; local storage supplies
+ * the last saved draft when the app is reopened. Sending, discarding and
+ * logging out clear saved text, which may contain sensitive terminal input.
  */
 const drafts = new Map<string, string>();
+const DRAFT_STORAGE_PREFIX = "terminalComposerDraft:v1:";
+const DRAFT_LOGOUT_KEY = "terminalComposerLogout";
+let draftLogoutEpoch = roamgateLocalStorage.getItem(DRAFT_LOGOUT_KEY) ?? "";
+const draftStorageKeys = new Map<string, string>();
+const savedDrafts = new Map<string, string>();
+const lastLocalWrites = new Map<string, string>();
 const selections = new Map<string, { start: number; end: number }>();
 const retiredDraftKeys = new Set<string>();
 const recoveredUploadKeys = new Set<string>();
@@ -25,6 +39,119 @@ const submissionListeners = new Map<
 >();
 const pendingUploads = new Map<string, number>();
 const uploadListeners = new Map<string, Set<TerminalComposerUploadListener>>();
+
+function clearStoredDrafts(storage: Storage, keepEpoch?: string): void {
+  const keepPrefix =
+    keepEpoch === undefined
+      ? null
+      : `${DRAFT_STORAGE_PREFIX}${JSON.stringify([keepEpoch]).slice(0, -1)},`;
+  try {
+    for (let i = 0; i < storage.length; i++) {
+      const key = storage.key(i);
+      if (
+        key?.startsWith(DRAFT_STORAGE_PREFIX) &&
+        (keepPrefix === null || !key.startsWith(keepPrefix))
+      )
+        storage.setItem(key, "");
+    }
+  } catch {
+    // Storage access can be denied; logout must still proceed.
+  }
+}
+
+function retireDraft(key: string): void {
+  retiredDraftKeys.add(key);
+  const storageKey = draftStorageKeys.get(key);
+  if (storageKey) saveDraft(storageKey, "", true);
+  draftStorageKeys.delete(key);
+  clearTerminalComposerDraft(key);
+  finishTerminalComposerSubmission(key);
+  clearTerminalComposerUploads(key);
+}
+
+function retireLiveDrafts(): void {
+  const keys = new Set([
+    ...draftStorageKeys.keys(),
+    ...drafts.keys(),
+    ...pendingSubmissions,
+    ...pendingUploads.keys(),
+  ]);
+  for (const key of keys) retiredDraftKeys.add(key);
+  savedDrafts.clear();
+  lastLocalWrites.clear();
+  draftStorageKeys.clear();
+  for (const key of keys) retireDraft(key);
+}
+
+function synchronizeDraftLogout(): void {
+  const epoch = roamgateLocalStorage.getItem(DRAFT_LOGOUT_KEY) ?? "";
+  if (epoch === draftLogoutEpoch) return;
+  draftLogoutEpoch = epoch;
+  clearStoredDrafts(roamgateSessionStorage, epoch);
+  retireLiveDrafts();
+}
+
+clearStoredDrafts(roamgateSessionStorage, draftLogoutEpoch);
+subscribeLocalStorage((key) => {
+  if (key === null || key === DRAFT_LOGOUT_KEY) synchronizeDraftLogout();
+});
+
+function saveDraft(storageKey: string, text: string, forceClear = false): void {
+  const previous = savedDrafts.get(storageKey) ?? "";
+  savedDrafts.set(storageKey, text);
+  for (const storage of [roamgateSessionStorage, roamgateLocalStorage]) {
+    try {
+      // Clearing this tab must not erase a newer draft saved by another tab.
+      if (
+        storage === roamgateLocalStorage &&
+        !text &&
+        !forceClear &&
+        (storage.getItem(storageKey) ?? "") !==
+          (lastLocalWrites.get(storageKey) ?? previous)
+      )
+        continue;
+      // Empty values prevent a cleared tab draft falling back to another tab.
+      storage.setItem(storageKey, text);
+      if (storage === roamgateLocalStorage)
+        lastLocalWrites.set(storageKey, text);
+    } catch {
+      // Keep editing and reconnect recovery working if storage is unavailable.
+    }
+  }
+}
+
+function restoreDraft(storageKey: string): string {
+  if (savedDrafts.has(storageKey)) return savedDrafts.get(storageKey)!;
+  const text =
+    roamgateSessionStorage.getItem(storageKey) ??
+    roamgateLocalStorage.getItem(storageKey) ??
+    "";
+  savedDrafts.set(storageKey, text);
+  try {
+    roamgateSessionStorage.setItem(storageKey, text);
+  } catch {
+    // The in-memory copy still isolates this tab's edits.
+  }
+  return text;
+}
+
+/** Remove sensitive drafts from this browser when its login session ends. */
+export function clearSavedTerminalComposerDrafts(): void {
+  for (const storage of [roamgateLocalStorage, roamgateSessionStorage]) {
+    clearStoredDrafts(storage);
+  }
+  try {
+    // Rotate after clearing text so even a full store has room for the marker.
+    roamgateLocalStorage.setItem(
+      DRAFT_LOGOUT_KEY,
+      `${Date.now()}-${Math.random()}`,
+    );
+  } catch {
+    // Storage access can be denied; logout must still proceed.
+  }
+  draftLogoutEpoch = roamgateLocalStorage.getItem(DRAFT_LOGOUT_KEY) ?? "";
+  retireLiveDrafts();
+}
 
 function notifyTerminalComposerDraft(key: string, text: string): void {
   for (const listener of draftListeners.get(key) ?? []) listener(text);
@@ -51,6 +178,7 @@ function terminalComposerDraftScopePrefix(
 }
 
 export function terminalComposerDraftKeyIsActive(key: string): boolean {
+  synchronizeDraftLogout();
   return (
     !retiredDraftKeys.has(key) &&
     (activeDraftScopePrefix === null || key.startsWith(activeDraftScopePrefix))
@@ -61,13 +189,20 @@ export function terminalComposerDraftKey(
   connectionId: string,
   connectionGeneration: number,
   paneId: string,
+  terminalId?: string,
 ): string {
   // Structured key: plain concatenation would let a digit-ending connection
   // ID collide across generations ("srv1"+2 vs "srv"+12).
-  return JSON.stringify([connectionId, connectionGeneration, paneId]);
+  return JSON.stringify([
+    connectionId,
+    connectionGeneration,
+    paneId,
+    ...(terminalId === undefined ? [] : [terminalId]),
+  ]);
 }
 
 export function readTerminalComposerDraft(key: string): string {
+  synchronizeDraftLogout();
   return drafts.get(key) ?? "";
 }
 
@@ -95,17 +230,22 @@ export function writeTerminalComposerSelection(
 }
 
 export function writeTerminalComposerDraft(key: string, text: string): void {
+  if (!terminalComposerDraftKeyIsActive(key)) return;
   if (!text) {
     clearTerminalComposerDraft(key);
     return;
   }
-  if (!terminalComposerDraftKeyIsActive(key)) return;
+  const storageKey = draftStorageKeys.get(key);
+  if (storageKey) saveDraft(storageKey, text);
   if (drafts.get(key) === text) return;
   drafts.set(key, text);
   notifyTerminalComposerDraft(key, text);
 }
 
 export function clearTerminalComposerDraft(key: string): void {
+  synchronizeDraftLogout();
+  const storageKey = draftStorageKeys.get(key);
+  if (storageKey) saveDraft(storageKey, "");
   recoveredUploadKeys.delete(key);
   selections.delete(key);
   if (!drafts.delete(key)) return;
@@ -238,14 +378,89 @@ export function subscribeTerminalComposerUpload(
 export function activateTerminalComposerDraftScope(
   connectionId: string,
   connectionGeneration: number,
+  panes?: readonly Pick<Pane, "pane_id" | "terminal_id">[],
+  connection?: ConnectionSummary,
 ): void {
+  synchronizeDraftLogout();
   activeDraftScopePrefix = terminalComposerDraftScopePrefix(
     connectionId,
     connectionGeneration,
   );
+  if (connection?.id === connectionId && panes) {
+    const destination = [
+      draftLogoutEpoch,
+      connectionId,
+      connection.source,
+      connection.type,
+      connection.control_socket_path,
+      connection.ssh_destination,
+      connection.remote_control_socket_path,
+      connection.remote_session,
+    ];
+    const storagePrefix = `${DRAFT_STORAGE_PREFIX}${JSON.stringify(destination).slice(0, -1)},`;
+    const targets = new Map(
+      panes.map((pane) => [
+        terminalComposerDraftKey(
+          connectionId,
+          connectionGeneration,
+          pane.pane_id,
+          pane.terminal_id,
+        ),
+        DRAFT_STORAGE_PREFIX +
+          JSON.stringify([...destination, pane.pane_id, pane.terminal_id]),
+      ]),
+    );
+    const survivingStorageKeys = new Set(targets.values());
+    for (const [key, storageKey] of draftStorageKeys) {
+      if (
+        storageKey.startsWith(storagePrefix) &&
+        !survivingStorageKeys.has(storageKey)
+      ) {
+        retireDraft(key);
+      }
+    }
+    // Reloaded tabs have saved drafts but no live mappings for removed panes.
+    const storedKeys = new Set(savedDrafts.keys());
+    for (const storage of [roamgateSessionStorage, roamgateLocalStorage]) {
+      try {
+        for (let i = 0; i < storage.length; i++) {
+          const key = storage.key(i);
+          if (key) storedKeys.add(key);
+        }
+      } catch {
+        // Live draft retirement still works when storage access is denied.
+      }
+    }
+    for (const storageKey of storedKeys) {
+      if (
+        storageKey.startsWith(storagePrefix) &&
+        !survivingStorageKeys.has(storageKey)
+      )
+        saveDraft(storageKey, "", true);
+    }
+    for (const [key, storageKey] of targets) {
+      if (retiredDraftKeys.has(key)) continue;
+      const previousStorageKey = draftStorageKeys.get(key);
+      if (previousStorageKey === storageKey) continue;
+      if (!previousStorageKey && drafts.has(key)) {
+        saveDraft(storageKey, drafts.get(key)!);
+      }
+      draftStorageKeys.set(key, storageKey);
+      const text = restoreDraft(storageKey);
+      if (text) drafts.set(key, text);
+      else drafts.delete(key);
+      notifyTerminalComposerDraft(key, text);
+    }
+  }
   for (const key of drafts.keys()) {
-    if (!terminalComposerDraftKeyIsActive(key) && !recoveredUploadKeys.has(key))
-      clearTerminalComposerDraft(key);
+    if (
+      !terminalComposerDraftKeyIsActive(key) &&
+      !recoveredUploadKeys.has(key)
+    ) {
+      // Retire the live lease without deleting the recoverable text.
+      drafts.delete(key);
+      notifyTerminalComposerDraft(key, "");
+    }
   }
   for (const key of selections.keys()) {
     if (!terminalComposerDraftKeyIsActive(key)) selections.delete(key);
@@ -281,15 +496,38 @@ export function insertIntoTerminalComposerDraft(
   return next;
 }
 
-/** Recovery only: uploaded paths must survive even a retired connection/pane.
- * Never reactivates the key or permits input/submission to that old target.
+/** Recovery only: keep paths on the original target without sending them.
+ * Reconnect callbacks append to saved text; closed/logged-out drafts stay gone.
  */
 export function retainTerminalComposerUploadPaths(
   key: string,
   paths: string,
 ): void {
-  recoveredUploadKeys.add(key);
   const current = readTerminalComposerDraft(key);
+  if (retiredDraftKeys.has(key)) return;
+  const storageKey = draftStorageKeys.get(key);
+  if (storageKey && !terminalComposerDraftKeyIsActive(key)) {
+    const saved = restoreDraft(storageKey);
+    // An old generation must not replace the new composer's selected text.
+    const next = terminalComposerInsertAtCaret(
+      saved,
+      saved.length,
+      saved.length,
+      paths,
+    );
+    saveDraft(storageKey, next.text);
+    for (const [target, targetStorageKey] of draftStorageKeys) {
+      if (
+        targetStorageKey === storageKey &&
+        terminalComposerDraftKeyIsActive(target)
+      ) {
+        drafts.set(target, next.text);
+        notifyTerminalComposerDraft(target, next.text);
+      }
+    }
+    return;
+  }
+  recoveredUploadKeys.add(key);
   const selection = readTerminalComposerSelection(key);
   const next = terminalComposerInsertAtCaret(
     current,
@@ -298,6 +536,9 @@ export function retainTerminalComposerUploadPaths(
     paths,
   );
   selections.set(key, { start: next.caret, end: next.caret });
+  if (storageKey && terminalComposerDraftKeyIsActive(key)) {
+    saveDraft(storageKey, next.text);
+  }
   drafts.set(key, next.text);
   notifyTerminalComposerDraft(key, next.text);
 }
@@ -305,6 +546,24 @@ export function retainTerminalComposerUploadPaths(
 /** Test hook: number of retained drafts. */
 export function terminalComposerDraftCount(): number {
   return drafts.size;
+}
+
+function paneDraftKeys(
+  connectionId: string,
+  generation: number,
+  paneId: string,
+): string[] {
+  const key = terminalComposerDraftKey(connectionId, generation, paneId);
+  const prefix = `${key.slice(0, -1)},`;
+  return [
+    ...new Set([
+      key,
+      ...draftStorageKeys.keys(),
+      ...drafts.keys(),
+      ...pendingSubmissions,
+      ...pendingUploads.keys(),
+    ]),
+  ].filter((candidate) => candidate === key || candidate.startsWith(prefix));
 }
 
 /**
@@ -316,11 +575,10 @@ export function terminalComposerDraftPaneIds(
   connectionGeneration: number,
   paneIds: readonly string[],
 ): string[] {
-  return paneIds.filter(
-    (paneId) =>
-      readTerminalComposerDraft(
-        terminalComposerDraftKey(connectionId, connectionGeneration, paneId),
-      ) !== "",
+  return paneIds.filter((paneId) =>
+    paneDraftKeys(connectionId, connectionGeneration, paneId).some(
+      (key) => readTerminalComposerDraft(key) !== "",
+    ),
   );
 }
 
@@ -331,15 +589,19 @@ export function clearTerminalComposerDrafts(
   paneIds: readonly string[],
 ): void {
   for (const paneId of paneIds) {
-    const key = terminalComposerDraftKey(
+    for (const key of paneDraftKeys(
       connectionId,
       connectionGeneration,
       paneId,
-    );
-    retiredDraftKeys.add(key);
-    clearTerminalComposerDraft(key);
-    finishTerminalComposerSubmission(key);
-    clearTerminalComposerUploads(key);
+    )) {
+      const storageKey = draftStorageKeys.get(key);
+      if (storageKey) {
+        for (const [candidate, candidateStorageKey] of draftStorageKeys) {
+          if (candidateStorageKey === storageKey) retireDraft(candidate);
+        }
+      }
+      retireDraft(key);
+    }
   }
 }
 
