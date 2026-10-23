@@ -1502,8 +1502,10 @@ export default function App() {
   const activePaneHasAgent = paneHasAgentHistory(activePane);
   const historyInspectorOpen =
     inspectorState?.open === true && inspectorState.view === "history";
+  const historyInspectorVisible =
+    historyInspectorOpen && (!mobile || mobileView === "history");
   const agentHistoryOpen =
-    historyInspectorOpen &&
+    historyInspectorVisible &&
     (!inspectorState.originPaneId ||
       inspectorState.originPaneId === activePane?.pane_id);
   const inspectorOriginPane = inspectorState?.originPaneId
@@ -1522,6 +1524,19 @@ export default function App() {
     inspectorWorkspace?.workspace_id
       ? inspectorHistoryPaneCandidate
       : undefined;
+  const mobileHistoryPaneId =
+    mobile && historyInspectorVisible
+      ? inspectorHistoryPane?.pane_id
+      : undefined;
+  const historyInputPending =
+    mobile && historyInspectorVisible && mobileHistoryPaneId !== activePaneId;
+  useEffect(() => {
+    if (
+      mobileHistoryPaneId &&
+      mobileHistoryPaneId !== activePaneIdForSnapshot(store.get())
+    )
+      void store.focusPane(mobileHistoryPaneId);
+  }, [mobileHistoryPaneId, resourceUiKey]);
   const annotationStorageKey = annotationScope
     ? annotationDraftStorageKey(annotationScope)
     : null;
@@ -4130,7 +4145,9 @@ export default function App() {
             >
               <div className="workspace-terminal-surface">
                 <TerminalPaneLayout
-                  mobileInputTarget={mobileInputTarget}
+                  mobileInputTarget={
+                    historyInputPending ? null : mobileInputTarget
+                  }
                   onActivateTerminalSurface={activateTerminalSurface}
                   visible={!mobile || mobileView === "session"}
                   terminalTheme={terminalTheme}
@@ -4138,7 +4155,7 @@ export default function App() {
                   terminalFontScale={terminalFontScale}
                   mobileShortcuts={mobileTerminalShortcuts}
                   mobileSideShortcuts={mobileTerminalSideShortcuts}
-                  composerOpen={terminalComposerOpen}
+                  composerOpen={terminalComposerOpen && !historyInputPending}
                   onComposerOpenChange={setTerminalComposerOpen}
                   agentHistoryOpen={agentHistoryOpen}
                   onAgentHistoryOpenChange={setAgentHistoryInspectorOpen}

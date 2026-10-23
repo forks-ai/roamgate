@@ -324,6 +324,13 @@
   .workspace-inspector-tabs {
     display: none;
   }
+
+  /* History owns its close action in the Session row. Keep the host header
+     available when no session can be rendered. */
+  .workspace-inspector[data-view="history"]:has(.agent-history-drawer)
+    .workspace-inspector-head {
+    display: none;
+  }
 }
 
 .workspace-inspector-file-detail {
